@@ -729,6 +729,7 @@ function otpFx(){
 async function verify(code){const er=$('#er'),fx=otpFx(),bad=async m=>{await fx.fail();er.textContent=m};try{const r=await fetch(`${CFG.DB}/${CFG.NS}/verify/${S.a.t}.json?t=${Date.now()}`,{cache:'no-store'}),v=await r.json();if(!v){await bad('Сначала нажмите Start в боте');return}
  if(v.nf){await bad('Аккаунт с этим номером не найден');return}
  if(v.dup){await bad('Этот номер уже зарегистрирован в другом Telegram — подробности в боте');return}
+ if(v.tgb){await bad('Этот Telegram уже привязан к номеру '+(v.m||'')+'. Войдите с этим номером');return}
  if(Date.now()>v.exp){await bad('Код устарел — откройте бота снова');return}
  if(await sha(S.a.t+code)!==v.h){await bad('Неверный код');document.querySelector('.otp').animate([{transform:'translateX(-8px)'},{transform:'translateX(8px)'},{transform:'none'}],{duration:260,iterations:2});return}
  const ph=p9(S.a.p),id=String(v.uid),nm=S.a.n||v.name||'Пользователь',rs=S.a.m=='fp';let pwr=null;try{pwr=await getPw(ph)}catch(e){}
