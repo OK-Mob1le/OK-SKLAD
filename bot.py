@@ -1,17 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OK-Mobile · бот входа и подписки
+OK-Mobile · бот входа и подписки (тарифы)
 
 Как это работает
-  1. В приложении пользователь жмёт «Оформить подписку» и попадает в этого бота.
-  2. Бот присылает реквизиты (карта, сумма, комментарий) и ждёт чек 10 минут.
+  1. Новый пользователь регистрируется в приложении → видит окно «Выберите тариф»:
+       • 3 дня бесплатно (один раз на пользователя)
+       • 1 месяц — $9.99
+       • 3 месяца — $8.88/мес = $26.64
+       • 6 месяцев — $7.77/мес = $46.62
+  2. Нажимает кнопку → попадает в бота, бот пишет, какой тариф выбран.
+       • Пробный период → бот сразу включает 3 дня (и сообщает админу).
+       • Платный тариф → бот присылает реквизиты (карта, сумма, комментарий) и ждёт чек 10 минут.
   3. Нет чека за 10 минут → «запрос отменён» + кнопка «Повторить».
-  4. Пришёл чек → пользователю «платёж обрабатывается», админу — чек, имя, номер
-     и кнопки «Подтвердить» / «Отказать».
-  5. Админ подтвердил → бот пишет в Firebase  premium/<telegram-id> = {until: мс},
-     пользователю приходит сообщение об успешной подписке, а приложение
-     разблокируется само (оно читает эту запись).
+  4. Пришёл чек → пользователю «платёж обрабатывается», админу — чек, имя, номер,
+     ТАРИФ и кнопки «Подтвердить» / «Отказать».
+  5. Админ подтвердил → бот пишет в Firebase  premium/<telegram-id> =
+       {until: мс, from: мс, plan: tr|m1|m3|m6}
+     Приложение показывает обратный отсчёт (дни/часы/минуты) от момента покупки до конца
+     подписки, а по окончании закрывает все функции замком.
+
+  6. Номер уже зарегистрирован на другой Telegram → бот не даёт код, а присылает ID, имя, @username
+     и ссылку на чат того аккаунта, на который номер был зарегистрирован.
+  7. Остатки: приложение кладёт новые «мало / закончилось» в Firebase  alerts/<telegram-id>,
+     бот забирает их и присылает пользователю сообщение (см. process_alerts).
 
 Запуск:  pip install -r requirements.txt  →  заполнить .env  →  python bot.py
 """
@@ -38,6 +50,29 @@ log = logging.getLogger("okmobile-bot")
 TZ = timezone(timedelta(hours=5))  # Таджикистан, UTC+5
 DAY_MS = 86_400_000
 
+# ───────────────────────────── тарифы ─────────────────────────────
+# id совпадает с id в приложении (index.html); 'tr' — бесплатный пробный период.
+PLANS: dict[str, dict[str, Any]] = {
+    "tr": {"name": "3 дня бесплатно", "days": 3, "usd": 0.0, "per": None},
+    "m1": {"name": "1 месяц", "days": 30, "usd": 9.99, "per": None},
+    "m3": {"name": "3 месяца", "days": 90, "usd": 26.64, "per": 8.88},
+    "m6": {"name": "6 месяцев", "days": 180, "usd": 46.62, "per": 7.77},
+}
+PAID = ("m1", "m3", "m6")
+FB_PLAN = {"tr": "trial", "m1": "m1", "m3": "m3", "m6": "m6"}  # что пишем в Firebase
+
+
+def usd(x: float) -> str:
+    return f"${x:.2f}"
+
+
+def plan_line(pid: str) -> str:
+    p = PLANS[pid]
+    if pid == "tr":
+        return "3 дня бесплатно"
+    extra = f" ({usd(p['per'])}/мес)" if p["per"] else ""
+    return f"{p['name']} — {usd(p['usd'])}{extra}"
+
 
 # ───────────────────────────── настройки ─────────────────────────────
 def load_env(path: str = ".env") -> None:
@@ -62,12 +97,13 @@ class Cfg:
         # Ключ Firebase можно передать не файлом, а переменной (удобно для Railway): JSON целиком или его base64
         self.cred_json = env.get("FIREBASE_CREDENTIALS_JSON", "").strip()
         self.ns = env.get("APP_NS", "okm").strip()
-        self.price = int(env.get("PRICE_TJS", "20"))
         self.card = env.get("CARD_NUMBER", "4444 8888 1227 1025").strip()
         self.holder = env.get("CARD_HOLDER", "EHSON IDIEV").strip()
-        self.note = env.get("PAY_NOTE", "Подписка премиума на 1 месяц").strip()
+        # Комментарий к переводу; {plan} подставится названием тарифа
+        self.note = env.get("PAY_NOTE", "Подписка премиума: {plan}").strip()
+        # Курс сомони за $1 — если задан, рядом с суммой в $ показывается «≈ N сомони» (0 = не показывать)
+        self.usd_tjs = float(env.get("USD_TJS", "0") or 0)
         self.wait_min = float(env.get("WAIT_MINUTES", "10"))
-        self.days = int(env.get("PREMIUM_DAYS", "30"))
         self.app_url = env.get("APP_URL", "").strip()
         self.sqlite = env.get("SQLITE_PATH", "premium.sqlite3").strip()
 
@@ -87,6 +123,16 @@ def fmt_d(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, TZ).strftime("%d.%m.%Y")
 
 
+def fmt_dm(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, TZ).strftime("%d.%m.%Y %H:%M")
+
+
+def fmt_left(ms: int) -> str:
+    ms = max(0, int(ms))
+    d, h, m = ms // DAY_MS, ms % DAY_MS // 3_600_000, ms % 3_600_000 // 60_000
+    return f"{d} д {h} ч {m} мин"
+
+
 def fmt_phone(p: str | None) -> str:
     d = re.sub(r"\D", "", p or "")[-9:]
     if len(d) == 9:
@@ -94,17 +140,23 @@ def fmt_phone(p: str | None) -> str:
     return f"+992 {d}" if d else "не указан"
 
 
-def parse_payload(payload: str) -> tuple[str, str]:
-    """start-параметр из приложения: 'p' + base64url('<телефон>|<имя>') → (телефон, имя)."""
+def parse_payload(payload: str) -> tuple[str, str, str]:
+    """start-параметр из приложения: 'p' + base64url('<телефон>|<тариф>|<имя>') → (телефон, имя, тариф).
+    Поддерживается и старый формат '<телефон>|<имя>' (тариф пустой)."""
     if not payload or payload[0] != "p":
-        return "", ""
+        return "", "", ""
     raw = payload[1:]
     try:
         text = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "ignore")
     except Exception:
-        return "", ""
-    phone, _, name = text.partition("|")
-    return re.sub(r"\D", "", phone)[-9:], name.strip()[:60]
+        return "", "", ""
+    parts = text.split("|", 2)
+    phone = re.sub(r"\D", "", parts[0])[-9:]
+    if len(parts) == 3:
+        plan, name = parts[1].strip(), parts[2]
+    else:
+        plan, name = "", (parts[1] if len(parts) > 1 else "")
+    return phone, name.strip()[:60], plan if plan in PLANS else ""
 
 
 def kb(rows: list[list[tuple[str, str]]]) -> dict:
@@ -166,15 +218,43 @@ class Firebase:
         firebase_admin.initialize_app(cred, {"databaseURL": db_url})
         self._db = db
 
-    def set_premium(self, uid: int, until_ms: int) -> None:
+    def set_premium(self, uid: int, until_ms: int, plan: str = "m1", since_ms: Optional[int] = None) -> None:
+        """premium/<uid> = {until, from, plan}. from — момент покупки (для отсчёта и полосы прогресса)."""
+        now = int(time.time() * 1000)
         self._db.reference(f"{self.ns}/premium/{uid}").set(
-            {"until": int(until_ms), "plan": "month", "updatedAt": int(time.time() * 1000)})
+            {"until": int(until_ms), "from": int(since_ms or now), "plan": plan, "updatedAt": now})
 
     def set_verify(self, token: str, data: dict) -> None:
         self._db.reference(f"{self.ns}/verify/{token}").set(data)
 
     def clear_premium(self, uid: int) -> None:
         self._db.reference(f"{self.ns}/premium/{uid}").delete()
+
+    # Владелец номера телефона (переживает потерю SQLite)
+    def phone_owner(self, phone: str) -> Optional[int]:
+        v = self._db.reference(f"{self.ns}/phones/{phone}").get()
+        return int(v["uid"]) if isinstance(v, dict) and str(v.get("uid", "")).lstrip("-").isdigit() else None
+
+    def set_phone_owner(self, phone: str, uid: int) -> None:
+        self._db.reference(f"{self.ns}/phones/{phone}").set({"uid": int(uid), "ts": int(time.time() * 1000)})
+
+    # Очередь уведомлений об остатках: alerts/<uid>/<key> = {ts, items:[{n,q,s}]}
+    def get_alerts(self) -> dict:
+        v = self._db.reference(f"{self.ns}/alerts").get()
+        return v if isinstance(v, dict) else {}
+
+    def del_alerts(self, uid: str, key: Optional[str] = None) -> None:
+        self._db.reference(f"{self.ns}/alerts/{uid}" + (f"/{key}" if key else "")).delete()
+
+    def has_premium(self, uid: int) -> bool:
+        return self._db.reference(f"{self.ns}/premium/{uid}").get() is not None
+
+    # Метка «пробный период уже использован» — переживает перезапуск/потерю SQLite
+    def has_trial(self, uid: int) -> bool:
+        return self._db.reference(f"{self.ns}/trial/{uid}").get() is not None
+
+    def set_trial(self, uid: int) -> None:
+        self._db.reference(f"{self.ns}/trial/{uid}").set({"ts": int(time.time() * 1000)})
 
 
 # ───────────────────────────── хранилище ─────────────────────────────
@@ -190,13 +270,25 @@ class Store:
             status TEXT NOT NULL,                -- awaiting | review | approved | rejected | expired
             created REAL NOT NULL, expires REAL NOT NULL,
             prompt_msg INTEGER, file_id TEXT, file_type TEXT, extras INTEGER DEFAULT 0,
-            decided_by INTEGER, decided REAL);
+            decided_by INTEGER, decided REAL, plan TEXT DEFAULT 'm1');
         CREATE TABLE IF NOT EXISTS admin_msgs(
             payment_id INTEGER, admin_id INTEGER, message_id INTEGER);
         CREATE TABLE IF NOT EXISTS premium(
             user_id INTEGER PRIMARY KEY, until INTEGER NOT NULL,      -- миллисекунды
-            warned INTEGER DEFAULT 0, ended INTEGER DEFAULT 0);
+            warned INTEGER DEFAULT 0, ended INTEGER DEFAULT 0,
+            since INTEGER DEFAULT 0, plan TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS trials(user_id INTEGER PRIMARY KEY, ts INTEGER);
+        CREATE TABLE IF NOT EXISTS phones(phone TEXT PRIMARY KEY, user_id INTEGER NOT NULL);
         """)
+        # миграция старой базы (до тарифов)
+        def cols(t: str) -> set[str]:
+            return {r[1] for r in self.c.execute(f"PRAGMA table_info({t})")}
+        if "plan" not in cols("payments"):
+            self.c.execute("ALTER TABLE payments ADD COLUMN plan TEXT DEFAULT 'm1'")
+        if "since" not in cols("premium"):
+            self.c.execute("ALTER TABLE premium ADD COLUMN since INTEGER DEFAULT 0")
+        if "plan" not in cols("premium"):
+            self.c.execute("ALTER TABLE premium ADD COLUMN plan TEXT DEFAULT ''")
         self.c.commit()
 
     # users
@@ -212,6 +304,24 @@ class Store:
     def user(self, uid: int) -> Optional[sqlite3.Row]:
         return self.c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
 
+    # владельцы номеров
+    def phone_owner(self, phone: str) -> Optional[int]:
+        r = self.c.execute("SELECT user_id FROM phones WHERE phone=?", (phone,)).fetchone()
+        return int(r["user_id"]) if r else None
+
+    def claim_phone(self, phone: str, uid: int) -> None:
+        self.c.execute("DELETE FROM phones WHERE user_id=?", (uid,))  # у одного Telegram — один номер
+        self.c.execute("INSERT OR REPLACE INTO phones(phone,user_id) VALUES(?,?)", (phone, uid))
+        self.c.commit()
+
+    # trial
+    def trial_used(self, uid: int) -> bool:
+        return self.c.execute("SELECT 1 FROM trials WHERE user_id=?", (uid,)).fetchone() is not None
+
+    def mark_trial(self, uid: int) -> None:
+        self.c.execute("INSERT OR IGNORE INTO trials(user_id,ts) VALUES(?,?)", (uid, int(time.time() * 1000)))
+        self.c.commit()
+
     # payments
     def payment(self, pid: int) -> Optional[sqlite3.Row]:
         return self.c.execute("SELECT * FROM payments WHERE id=?", (pid,)).fetchone()
@@ -225,15 +335,23 @@ class Store:
         return self.c.execute(
             "SELECT * FROM payments WHERE user_id=? AND status='review' ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
 
+    def last_plan(self, uid: int) -> str:
+        r = self.c.execute("SELECT plan FROM payments WHERE user_id=? ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
+        return (r["plan"] if r and r["plan"] in PAID else "") or ""
+
     def all_review(self) -> list[sqlite3.Row]:
         return self.c.execute("SELECT * FROM payments WHERE status='review' ORDER BY id").fetchall()
 
-    def create_request(self, uid: int, chat_id: int, now: float, wait_s: float) -> int:
+    def create_request(self, uid: int, chat_id: int, now: float, wait_s: float, plan: str) -> int:
         cur = self.c.execute(
-            "INSERT INTO payments(user_id,chat_id,status,created,expires) VALUES(?,?,?,?,?)",
-            (uid, chat_id, "awaiting", now, now + wait_s))
+            "INSERT INTO payments(user_id,chat_id,status,created,expires,plan) VALUES(?,?,?,?,?,?)",
+            (uid, chat_id, "awaiting", now, now + wait_s, plan))
         self.c.commit()
         return int(cur.lastrowid)
+
+    def set_plan(self, pid: int, plan: str) -> None:
+        self.c.execute("UPDATE payments SET plan=? WHERE id=?", (plan, pid))
+        self.c.commit()
 
     def set_prompt(self, pid: int, msg_id: int) -> None:
         self.c.execute("UPDATE payments SET prompt_msg=? WHERE id=?", (msg_id, pid))
@@ -274,19 +392,23 @@ class Store:
     def premium(self, uid: int) -> Optional[sqlite3.Row]:
         return self.c.execute("SELECT * FROM premium WHERE user_id=?", (uid,)).fetchone()
 
-    def set_premium(self, uid: int, until_ms: int) -> None:
+    def set_premium(self, uid: int, until_ms: int, since_ms: int = 0, plan: str = "") -> None:
         self.c.execute(
-            "INSERT INTO premium(user_id,until,warned,ended) VALUES(?,?,0,0) "
-            "ON CONFLICT(user_id) DO UPDATE SET until=?, warned=0, ended=0", (uid, until_ms, until_ms))
+            "INSERT INTO premium(user_id,until,warned,ended,since,plan) VALUES(?,?,0,0,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET until=?, warned=0, ended=0, since=?, plan=?",
+            (uid, until_ms, since_ms, plan, until_ms, since_ms, plan))
         self.c.commit()
 
     def del_premium(self, uid: int) -> None:
         self.c.execute("DELETE FROM premium WHERE user_id=?", (uid,))
         self.c.commit()
 
-    def expiring(self, now_ms: int, within_ms: int) -> list[sqlite3.Row]:
+    def expiring(self, now_ms: int) -> list[sqlite3.Row]:
+        """Предупреждаем за 3 дня до конца подписки и за 1 день до конца пробного периода."""
         return self.c.execute(
-            "SELECT * FROM premium WHERE warned=0 AND until>? AND until<=?", (now_ms, now_ms + within_ms)).fetchall()
+            "SELECT * FROM premium WHERE warned=0 AND until>? AND "
+            "((plan!='trial' AND until<=?) OR (plan='trial' AND until<=?))",
+            (now_ms, now_ms + 3 * DAY_MS, now_ms + DAY_MS)).fetchall()
 
     def ended(self, now_ms: int) -> list[sqlite3.Row]:
         return self.c.execute("SELECT * FROM premium WHERE ended=0 AND until<=?", (now_ms,)).fetchall()
@@ -302,6 +424,7 @@ class PremiumBot:
     def __init__(self, cfg: Cfg, tg: Telegram, store: Store, fb, clock: Callable[[], float] = time.time):
         self.cfg, self.tg, self.store, self.fb, self.now = cfg, tg, store, fb, clock
         self._last_notice = 0.0
+        self._last_alerts = 0.0
 
     # --- отправка ---
     def send(self, chat_id: int, text: str, markup: Optional[dict] = None) -> Optional[dict]:
@@ -313,20 +436,36 @@ class PremiumBot:
     def answer(self, cq_id: str, text: str = "", alert: bool = False) -> None:
         self.tg.call("answerCallbackQuery", callback_query_id=cq_id, text=text, show_alert=alert)
 
+    def open_app_kb(self) -> Optional[dict]:
+        return kb([[("📱 Открыть приложение", "url:" + self.cfg.app_url)]]) if self.cfg.app_url.startswith("http") else None
+
     # --- тексты ---
+    def money(self, pid: str) -> str:
+        """Сумма тарифа: «$26.64» и, если задан USD_TJS, «≈ 280 сомони»."""
+        p = PLANS[pid]
+        s = usd(p["usd"])
+        if self.cfg.usd_tjs > 0:
+            s += f" (≈ {round(p['usd'] * self.cfg.usd_tjs)} сомони)"
+        return s
+
     def requisites_text(self, pay, premium_until_ms: Optional[int]) -> str:
         c = self.cfg
+        pid = pay["plan"] if pay["plan"] in PAID else "m1"
+        p = PLANS[pid]
         left = max(1, math.ceil((pay["expires"] - self.now()) / 60))
         extra = ""
         if premium_until_ms and premium_until_ms > self.now() * 1000:
-            extra = (f"У вас уже есть Премиум до <b>{fmt_d(premium_until_ms)}</b>. "
-                     f"Оплата продлит подписку ещё на 1 месяц.\n\n")
+            extra = (f"У вас уже есть Премиум до <b>{fmt_dm(premium_until_ms)}</b>. "
+                     f"Оплата продлит подписку ещё на {p['name']}.\n\n")
+        per = f"\nЦена за месяц: <b>{usd(p['per'])}</b>" if p["per"] else ""
+        note = c.note.replace("{plan}", p["name"])
         return (
-            f"💎 <b>Премиум на 1 месяц — {c.price} сомони</b>\n\n{extra}"
+            f"💎 <b>Вы выбрали тариф: {p['name']}</b>\n"
+            f"К оплате: <b>{self.money(pid)}</b>{per}\n\n{extra}"
             f"Оплатите на карту:\n<code>{html.escape(c.card)}</code>\n"
             f"Получатель: <b>{html.escape(c.holder)}</b>\n"
-            f"Сумма: <b>{c.price} сомони</b>\n"
-            f"Комментарий к переводу: <code>{html.escape(c.note)}</code>\n\n"
+            f"Сумма: <b>{self.money(pid)}</b>\n"
+            f"Комментарий к переводу: <code>{html.escape(note)}</code>\n\n"
             f"После оплаты отправьте сюда чек — фото или скриншот.\n"
             f"⏳ Время ожидания — <b>{left} мин.</b>")
 
@@ -334,13 +473,15 @@ class PremiumBot:
         u = self.store.user(pay["user_id"])
         name = html.escape((u["name"] if u and u["name"] else "") or (u["tg_name"] if u else "") or "—")
         uname = f"@{html.escape(u['username'])}" if u and u["username"] else "без username"
+        pid = pay["plan"] if pay["plan"] in PAID else "m1"
         return (
             f"🧾 <b>Чек на подписку Премиум</b> · заявка #{pay['id']}\n"
             f"👤 Имя: <b>{name}</b>\n"
             f"📞 Номер: <b>{fmt_phone(u['phone'] if u else '')}</b>\n"
             f"✈️ Telegram: {uname} · ID <code>{pay['user_id']}</code> · "
             f"<a href=\"tg://user?id={pay['user_id']}\">открыть чат</a>\n"
-            f"💰 {self.cfg.price} сомони · 1 месяц\n"
+            f"🏷 Тариф: <b>{PLANS[pid]['name']}</b>\n"
+            f"💰 Сумма: <b>{self.money(pid)}</b>\n"
             f"🕒 {fmt_dt(pay['created'])}{suffix}")
 
     def retry_kb(self) -> dict:
@@ -365,8 +506,10 @@ class PremiumBot:
                 return self.cmd_start(m, arg)
             if cmd == "/status":
                 return self.cmd_status(frm["id"], chat_id)
+            if cmd == "/tariffs":
+                return self.plans_menu(frm["id"], chat_id)
             if cmd == "/help":
-                return self.send(chat_id, "Нажмите /start, чтобы оформить Премиум, или /status, чтобы узнать срок подписки.")
+                return self.send(chat_id, "Нажмите /start, чтобы выбрать тариф, или /status, чтобы узнать срок подписки.")
             if frm["id"] in self.cfg.admins:
                 if cmd == "/grant":
                     return self.cmd_grant(chat_id, arg)
@@ -380,52 +523,158 @@ class PremiumBot:
         if self.store.active_request(frm["id"], self.now()):
             self.send(chat_id, "Отправьте чек об оплате <b>фото или скриншотом</b>.")
         else:
-            self.send(chat_id, "Чтобы оформить Премиум, нажмите /start.")
+            self.send(chat_id, "Чтобы выбрать тариф, нажмите /start.")
 
     def remember_user(self, frm: dict, phone: str = "", name: str = "") -> None:
         full = " ".join(x for x in (frm.get("first_name"), frm.get("last_name")) if x)
         self.store.upsert_user(frm["id"], name, phone, frm.get("username") or "", full)
 
-    def login_code(self, m: dict, token: str) -> None:
-        """Вход в приложение: бот шлёт 6-значный код, а в Firebase кладёт только его хэш."""
+    def owner_card(self, owner: int) -> str:
+        """Кто владелец номера: имя, @username, ID и ссылка на чат."""
+        u = self.store.user(owner)
+        name, uname = (u["tg_name"] or u["name"] or "") if u else "", (u["username"] or "") if u else ""
+        if not (name or uname):  # в базе нет — спросим у Telegram
+            ch = self.tg.call("getChat", chat_id=owner) or {}
+            name = " ".join(x for x in (ch.get("first_name"), ch.get("last_name")) if x)
+            uname = ch.get("username") or ""
+        return (f"👤 Имя: <b>{html.escape(name) or '—'}</b>\n"
+                f"✈️ Username: {'@' + html.escape(uname) if uname else 'нет'}\n"
+                f"🆔 Telegram ID: <code>{owner}</code>\n"
+                f"💬 <a href=\"tg://user?id={owner}\">Открыть чат</a>")
+
+    def phone_conflict(self, phone: str, uid: int) -> Optional[int]:
+        """Если номер уже закреплён за другим Telegram — вернёт его ID."""
+        owner = self.store.phone_owner(phone)
+        if owner is None:
+            try:
+                owner = self.fb.phone_owner(phone)
+            except Exception:
+                log.exception("Firebase phone_owner")
+        return owner if owner is not None and owner != uid else None
+
+    def login_code(self, m: dict, arg: str) -> None:
+        """Вход в приложение: бот шлёт 6-значный код, а в Firebase кладёт только его хэш.
+        arg = '<токен>' или '<токен>_<телефон 9 цифр>' (из приложения)."""
         frm, chat_id = m["from"], m["chat"]["id"]
+        token, _, ph = arg.partition("_")
+        phone = ph if re.fullmatch(r"\d{9}", ph) else ""
         if not re.fullmatch(r"[0-9a-f]{16,64}", token):
             return self.send(chat_id, "Ссылка входа недействительна. Откройте приложение и повторите.")
-        code = str(secrets.randbelow(900000) + 100000)
         name = " ".join(x for x in (frm.get("first_name"), frm.get("last_name")) if x)
+        if phone:
+            owner = self.phone_conflict(phone, frm["id"])
+            if owner is not None:
+                try:  # приложение увидит «номер занят» вместо ожидания кода
+                    self.fb.set_verify(token, {"dup": True, "exp": int((self.now() + 600) * 1000)})
+                except Exception:
+                    log.exception("Firebase verify dup")
+                return self.send(
+                    chat_id,
+                    f"⚠️ <b>Аккаунт с номером {fmt_phone(phone)} уже существует.</b>\n"
+                    f"Номер зарегистрирован на другой Telegram-аккаунт:\n\n{self.owner_card(owner)}\n\n"
+                    f"Войдите с того аккаунта или укажите в приложении другой номер.")
+        code = str(secrets.randbelow(900000) + 100000)
         try:
             self.fb.set_verify(token, {"uid": frm["id"], "name": name, "h": hashlib.sha256((token + code).encode()).hexdigest(),
                                        "exp": int((self.now() + 600) * 1000)})
         except Exception:
             log.exception("Firebase verify")
             return self.send(chat_id, "⚠️ Сервер временно недоступен. Попробуйте ещё раз.")
-        self.remember_user(frm)
+        self.remember_user(frm, phone)
+        if phone:  # номер закрепляется за этим Telegram
+            self.store.claim_phone(phone, frm["id"])
+            try:
+                self.fb.set_phone_owner(phone, frm["id"])
+            except Exception:
+                log.exception("Firebase set_phone_owner")
         self.send(chat_id, f"🔐 Код входа в OK-Mobile: <code>{code}</code>\nДействует 10 минут. Никому его не сообщайте.")
 
     def cmd_start(self, m: dict, payload: str) -> None:
         if payload.startswith("v"):
             return self.login_code(m, payload[1:])
-        phone, name = parse_payload(payload)
+        phone, name, plan = parse_payload(payload)
         self.remember_user(m["from"], phone, name)
-        self.offer(m["from"]["id"], m["chat"]["id"])
+        uid, chat_id = m["from"]["id"], m["chat"]["id"]
+        if plan == "tr":
+            return self.start_trial(m["from"], chat_id)
+        if plan in PAID:
+            return self.offer(uid, chat_id, plan)
+        self.plans_menu(uid, chat_id)
 
     def cmd_status(self, uid: int, chat_id: int) -> None:
         p = self.store.premium(uid)
-        if p and p["until"] > self.now() * 1000:
-            self.send(chat_id, f"✅ Премиум активен до <b>{fmt_d(p['until'])}</b>.",
-                      kb([[("➕ Продлить на 1 месяц", "retry")]]))
+        now_ms = int(self.now() * 1000)
+        if p and p["until"] > now_ms:
+            name = PLANS.get({"trial": "tr"}.get(p["plan"], p["plan"]), {}).get("name", "Премиум")
+            self.send(chat_id,
+                      f"✅ Премиум активен ({name}) до <b>{fmt_dm(p['until'])}</b>.\n"
+                      f"Осталось: <b>{fmt_left(p['until'] - now_ms)}</b>.",
+                      kb([[("➕ Продлить", "menu")]]))
         else:
-            self.send(chat_id, "Премиум не активен.", kb([[("💎 Оформить подписку", "retry")]]))
+            self.send(chat_id, "Премиум не активен.", kb([[("💎 Выбрать тариф", "menu")]]))
 
-    def offer(self, uid: int, chat_id: int) -> None:
-        """Показать реквизиты (создать заявку на оплату, если активной ещё нет)."""
+    # --- выбор тарифа ---
+    def trial_available(self, uid: int) -> bool:
+        return not self.store.trial_used(uid) and not self.store.premium(uid)
+
+    def plans_menu(self, uid: int, chat_id: int) -> None:
+        rows: list[list[tuple[str, str]]] = []
+        lines = ["💎 <b>Выберите тариф Премиум</b>\n"]
+        if self.trial_available(uid):
+            lines.append("🎁 3 дня бесплатно — один раз, без оплаты")
+            rows.append([("🎁 3 дня бесплатно", "pl:tr")])
+        for pid in PAID:
+            p = PLANS[pid]
+            lines.append(f"• {plan_line(pid)}")
+            rows.append([(f"{p['name']} — {usd(p['usd'])}", f"pl:{pid}")])
+        self.send(chat_id, "\n".join(lines), kb(rows))
+
+    def start_trial(self, frm: dict, chat_id: int) -> None:
+        uid, now = frm["id"], self.now()
+        now_ms = int(now * 1000)
+        cur = self.store.premium(uid)
+        if cur and cur["until"] > now_ms:
+            return self.send(chat_id, f"У вас уже активен Премиум до <b>{fmt_dm(cur['until'])}</b>.", self.open_app_kb())
+        try:
+            used = self.store.trial_used(uid) or self.fb.has_trial(uid) or bool(cur)
+        except Exception:
+            log.exception("Firebase trial check")
+            return self.send(chat_id, "⚠️ Сервер временно недоступен. Попробуйте ещё раз.")
+        if used:
+            self.send(chat_id, "Пробный период уже использован. Выберите тариф:")
+            return self.plans_menu(uid, chat_id)
+        until = now_ms + PLANS["tr"]["days"] * DAY_MS
+        try:
+            self.fb.set_trial(uid)
+            self.fb.set_premium(uid, until, FB_PLAN["tr"], now_ms)
+        except Exception:
+            log.exception("Firebase: не удалось включить пробный период %s", uid)
+            return self.send(chat_id, "⚠️ Не удалось включить пробный период. Попробуйте ещё раз чуть позже.")
+        self.store.mark_trial(uid)
+        self.store.set_premium(uid, until, now_ms, "trial")
+        self.send(chat_id,
+                  f"🎁 <b>Вы выбрали: 3 дня бесплатно</b>\nПробный период включён до <b>{fmt_dm(until)}</b>.\n"
+                  f"Откройте приложение — все функции доступны. Когда срок закончится, выберите тариф командой /tariffs.",
+                  self.open_app_kb())
+        u = self.store.user(uid)
+        who = html.escape((u["name"] if u and u["name"] else "") or (u["tg_name"] if u else "") or str(uid))
+        for admin in self.cfg.admins:
+            self.send(admin, f"🎁 Пробный период (3 дня): <b>{who}</b> · {fmt_phone(u['phone'] if u else '')} · "
+                             f"ID <code>{uid}</code>")
+
+    def offer(self, uid: int, chat_id: int, plan: str = "") -> None:
+        """Показать реквизиты выбранного тарифа (создать заявку на оплату, если активной ещё нет)."""
+        plan = plan if plan in PAID else (self.store.last_plan(uid) or "m1")
         if self.store.review_request(uid):
             return self._processing(chat_id)
         now = self.now()
         pay = self.store.active_request(uid, now)
         if not pay:
-            pid = self.store.create_request(uid, chat_id, now, self.cfg.wait_min * 60)
+            pid = self.store.create_request(uid, chat_id, now, self.cfg.wait_min * 60, plan)
             pay = self.store.payment(pid)
+        elif pay["plan"] != plan:  # передумал — меняем тариф в активной заявке
+            self.store.set_plan(pay["id"], plan)
+            pay = self.store.payment(pay["id"])
         prem = self.store.premium(uid)
         sent = self.send(chat_id, self.requisites_text(pay, prem["until"] if prem else None))
         if sent:
@@ -485,10 +734,22 @@ class PremiumBot:
         data, frm = cq.get("data") or "", cq["from"]
         msg = cq.get("message") or {}
         chat_id = (msg.get("chat") or {}).get("id", frm["id"])
-        if data == "retry":
+        if data == "retry":  # повторить прошлый тариф (или показать список)
             self.answer(cq["id"])
             self.remember_user(frm)
-            return self.offer(frm["id"], chat_id)
+            plan = self.store.last_plan(frm["id"])
+            return self.offer(frm["id"], chat_id, plan) if plan else self.plans_menu(frm["id"], chat_id)
+        if data == "menu":
+            self.answer(cq["id"])
+            self.remember_user(frm)
+            return self.plans_menu(frm["id"], chat_id)
+        pm = re.fullmatch(r"pl:(tr|m1|m3|m6)", data)
+        if pm:
+            self.answer(cq["id"])
+            self.remember_user(frm)
+            if pm.group(1) == "tr":
+                return self.start_trial(frm, chat_id)
+            return self.offer(frm["id"], chat_id, pm.group(1))
         m = re.fullmatch(r"(ok|no):(\d+)", data)
         if not m:
             return self.answer(cq["id"])
@@ -504,23 +765,28 @@ class PremiumBot:
             labels = {"approved": "уже подтверждена", "rejected": "уже отклонена", "awaiting": "чек ещё не получен", "expired": "запрос отменён"}
             return self.answer(cq_id, f"Заявка #{pid}: {labels.get(pay['status'], pay['status'])}", True)
         uid, now = pay["user_id"], self.now()
+        plan = pay["plan"] if pay["plan"] in PAID else "m1"
+        p = PLANS[plan]
         who = html.escape(admin.get("first_name") or admin.get("username") or str(admin["id"]))
         if approve:
+            now_ms = int(now * 1000)
             cur = self.store.premium(uid)
-            base = max(int(now * 1000), cur["until"] if cur else 0)
-            until = base + self.cfg.days * DAY_MS
+            active = bool(cur and cur["until"] > now_ms)
+            since = (cur["since"] or now_ms) if active else now_ms  # начало отсчёта: первая покупка в текущем периоде
+            until = max(now_ms, cur["until"] if cur else 0) + p["days"] * DAY_MS
             try:
-                self.fb.set_premium(uid, until)
+                self.fb.set_premium(uid, until, FB_PLAN[plan], since)
             except Exception:
                 log.exception("Firebase: не удалось записать подписку %s", uid)
                 return self.answer(cq_id, "❌ Не удалось записать подписку в Firebase. Проверьте настройки и нажмите ещё раз.", True)
-            self.store.set_premium(uid, until)
+            self.store.set_premium(uid, until, since, plan)
             self.store.set_status(pid, "approved", admin["id"], now)
             self.answer(cq_id, "Подтверждено")
-            markup = kb([[("📱 Открыть приложение", "url:" + self.cfg.app_url)]]) if self.cfg.app_url.startswith("http") else None
             self.send(pay["chat_id"],
-                      f"🎉 <b>Подписка Премиум оформлена!</b>\nДействует до <b>{fmt_d(until)}</b>.\n"
-                      f"Ваш профиль в приложении разблокирован — откройте OK-Mobile.", markup)
+                      f"🎉 <b>Подписка Премиум оформлена!</b>\n"
+                      f"Тариф: <b>{p['name']}</b>\n"
+                      f"Действует до <b>{fmt_dm(until)}</b> · осталось <b>{fmt_left(until - now_ms)}</b>.\n"
+                      f"Ваш профиль в приложении разблокирован — откройте OK-Mobile.", self.open_app_kb())
             self._mark_admin_cards(pid, f"\n\n✅ <b>Подтверждено</b> · {who} · {fmt_dt(now)}")
         else:
             self.store.set_status(pid, "rejected", admin["id"], now)
@@ -541,18 +807,21 @@ class PremiumBot:
     def cmd_grant(self, chat_id: int, arg: str) -> None:
         parts = arg.split()
         if not parts or not parts[0].isdigit():
-            return self.send(chat_id, "Формат: /grant <telegram_id> [дней]")
-        uid, days = int(parts[0]), int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else self.cfg.days
+            return self.send(chat_id, "Формат: /grant <telegram_id> [дней]  (по умолчанию 30)")
+        uid, days = int(parts[0]), int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 30
+        now_ms = int(self.now() * 1000)
         cur = self.store.premium(uid)
-        until = max(int(self.now() * 1000), cur["until"] if cur else 0) + days * DAY_MS
+        active = bool(cur and cur["until"] > now_ms)
+        since = (cur["since"] or now_ms) if active else now_ms
+        until = max(now_ms, cur["until"] if cur else 0) + days * DAY_MS
         try:
-            self.fb.set_premium(uid, until)
+            self.fb.set_premium(uid, until, "gift", since)
         except Exception:
             log.exception("Firebase grant")
             return self.send(chat_id, "❌ Не удалось записать в Firebase, см. журнал бота.")
-        self.store.set_premium(uid, until)
-        self.send(uid, f"🎁 Вам активирован Премиум до <b>{fmt_d(until)}</b>. Откройте приложение OK-Mobile.")
-        self.send(chat_id, f"✅ Премиум для <code>{uid}</code> до {fmt_d(until)}.")
+        self.store.set_premium(uid, until, since, "gift")
+        self.send(uid, f"🎁 Вам активирован Премиум до <b>{fmt_dm(until)}</b>. Откройте приложение OK-Mobile.")
+        self.send(chat_id, f"✅ Премиум для <code>{uid}</code> до {fmt_dm(until)}.")
 
     def cmd_revoke(self, chat_id: int, arg: str) -> None:
         if not arg.strip().isdigit():
@@ -596,26 +865,83 @@ class PremiumBot:
         if now - self._last_notice >= 60:
             self._last_notice = now
             self.subscription_notices()
+        self.process_alerts()
 
     def subscription_notices(self) -> None:
         now_ms = int(self.now() * 1000)
-        for r in self.store.expiring(now_ms, 3 * DAY_MS):
-            self.send(r["user_id"], f"⏰ Ваш Премиум заканчивается <b>{fmt_d(r['until'])}</b>. "
-                                    f"Продлите заранее — новый месяц добавится к текущему сроку.",
-                      kb([[("➕ Продлить на 1 месяц", "retry")]]))
+        for r in self.store.expiring(now_ms):
+            trial = r["plan"] == "trial"
+            what = "Пробный период" if trial else "Ваш Премиум"
+            self.send(r["user_id"], f"⏰ {what} заканчивается <b>{fmt_dm(r['until'])}</b> "
+                                    f"(осталось {fmt_left(r['until'] - now_ms)}). "
+                                    f"Выберите тариф заранее — новый срок добавится к текущему.",
+                      kb([[("➕ Выбрать тариф", "menu")]]))
             self.store.mark(r["user_id"], "warned")
         for r in self.store.ended(now_ms):
-            self.send(r["user_id"], "Срок вашего Премиума закончился. Функции приложения снова заблокированы.",
-                      kb([[("💎 Оформить подписку", "retry")]]))
+            trial = r["plan"] == "trial"
+            self.send(r["user_id"],
+                      ("Пробный период закончился." if trial else "Срок вашего Премиума закончился.")
+                      + " Функции приложения закрыты замком — выберите тариф, чтобы открыть их снова.",
+                      kb([[("💎 Выбрать тариф", "menu")]]))
+            # Запись в Firebase остаётся: приложение само закрывается по времени (until) и показывает дату окончания.
             self.store.mark(r["user_id"], "ended")
-            try:
-                self.fb.clear_premium(r["user_id"])
-            except Exception:
-                log.exception("Firebase clear")
+
+    # --- уведомления об остатках ---
+    def process_alerts(self) -> None:
+        now = self.now()
+        if now - self._last_alerts < 8:
+            return
+        self._last_alerts = now
+        try:
+            queue = self.fb.get_alerts()
+        except Exception:
+            log.exception("Firebase alerts")
+            return
+        for uid_s, entries in list(queue.items())[:50]:
+            if not str(uid_s).isdigit() or not isinstance(entries, dict):
+                continue
+            uid = int(uid_s)
+            known = bool(self.store.user(uid))
+            if not known:
+                try:
+                    known = self.fb.has_premium(uid)  # не шлём незнакомым ID
+                except Exception:
+                    known = False
+            items: list[dict] = []
+            if known:
+                for key in sorted(entries):
+                    e = entries[key]
+                    for it in (e.get("items") if isinstance(e, dict) else None) or []:
+                        if isinstance(it, dict) and it.get("s") in ("l", "z"):
+                            items.append(it)
+            ok = True
+            for chunk in range(0, len(items), 30):
+                ok = bool(self.send(uid, self.stock_text(items[chunk:chunk + 30]))) and ok
+            if ok or not known:  # при ошибке отправки оставим в очереди до следующего цикла
+                try:
+                    self.fb.del_alerts(uid_s)
+                except Exception:
+                    log.exception("Firebase del_alerts")
+
+    @staticmethod
+    def stock_text(items: list[dict]) -> str:
+        def line(it: dict) -> str:
+            q = it.get("q")
+            q = int(q) if isinstance(q, (int, float)) and float(q).is_integer() else q
+            return f"• {html.escape(str(it.get('n', '—'))[:80])} — {html.escape(str(q))} шт."
+        zero = [it for it in items if it["s"] == "z"]
+        low = [it for it in items if it["s"] == "l"]
+        out = ["📦 <b>Остатки на складе</b>"]
+        if zero:
+            out += ["", "🔴 <b>Закончилось:</b>"] + [line(i) for i in zero]
+        if low:
+            out += ["", "🟠 <b>Мало осталось:</b>"] + [line(i) for i in low]
+        out += ["", "Пополните склад в приложении OK-SKLAD."]
+        return "\n".join(out)
 
     def poll_timeout(self) -> int:
         nxt = self.store.next_expiry()
-        return 25 if nxt is None else max(1, min(25, math.ceil(nxt - self.now())))
+        return 8 if nxt is None else max(1, min(8, math.ceil(nxt - self.now())))
 
     # --- главный цикл ---
     def run(self) -> None:
