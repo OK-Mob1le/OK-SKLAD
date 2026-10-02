@@ -24,6 +24,10 @@ OK-Mobile · бот входа и подписки (тарифы)
      и ссылку на чат того аккаунта, на который номер был зарегистрирован.
   7. Остатки: приложение кладёт новые «мало / закончилось» в Firebase  alerts/<telegram-id>,
      бот забирает их и присылает пользователю сообщение (см. process_alerts).
+  8. Telegram привязан к одному номеру: при первой регистрации бот запоминает chat id + номер
+     (SQLite phones и Firebase phones/<номер>, tgphone/<uid>). Если с этого же Telegram пытаются
+     зарегистрировать ДРУГОЙ номер — бот не даёт код, а пишет «Этот Telegram уже привязан к номеру
+     +992 92 ***** 6»; приложение показывает ту же ошибку. Отвязать номер может админ: /unbind <id>.
 
 Запуск:  pip install -r requirements.txt  →  заполнить .env  →  python bot.py
 """
@@ -140,6 +144,12 @@ def fmt_phone(p: str | None) -> str:
     return f"+992 {d}" if d else "не указан"
 
 
+def mask_phone(p: str | None) -> str:
+    """+992 92 ***** 6 — две первые цифры и последняя."""
+    d = re.sub(r"\D", "", p or "")[-9:]
+    return f"+992 {d[:2]} ***** {d[-1]}" if len(d) == 9 else "+992 ***** *"
+
+
 def parse_payload(payload: str) -> tuple[str, str, str]:
     """start-параметр из приложения: 'p' + base64url('<телефон>|<тариф>|<имя>') → (телефон, имя, тариф).
     Поддерживается и старый формат '<телефон>|<имя>' (тариф пустой)."""
@@ -238,6 +248,20 @@ class Firebase:
     def set_phone_owner(self, phone: str, uid: int) -> None:
         self._db.reference(f"{self.ns}/phones/{phone}").set({"uid": int(uid), "ts": int(time.time() * 1000)})
 
+    # Номер, к которому привязан Telegram: tgphone/<uid> = {phone, ts}
+    def uid_phone(self, uid: int) -> Optional[str]:
+        v = self._db.reference(f"{self.ns}/tgphone/{uid}").get()
+        return str(v["phone"]) if isinstance(v, dict) and v.get("phone") else None
+
+    def set_uid_phone(self, uid: int, phone: str) -> None:
+        self._db.reference(f"{self.ns}/tgphone/{uid}").set({"phone": phone, "ts": int(time.time() * 1000)})
+
+    def unbind(self, uid: int) -> None:
+        p = self.uid_phone(uid)
+        if p:
+            self._db.reference(f"{self.ns}/phones/{p}").delete()
+        self._db.reference(f"{self.ns}/tgphone/{uid}").delete()
+
     # Очередь уведомлений об остатках: alerts/<uid>/<key> = {ts, items:[{n,q,s}]}
     def get_alerts(self) -> dict:
         v = self._db.reference(f"{self.ns}/alerts").get()
@@ -309,9 +333,18 @@ class Store:
         r = self.c.execute("SELECT user_id FROM phones WHERE phone=?", (phone,)).fetchone()
         return int(r["user_id"]) if r else None
 
+    def phone_of(self, uid: int) -> Optional[str]:
+        """Номер, к которому уже привязан этот Telegram."""
+        r = self.c.execute("SELECT phone FROM phones WHERE user_id=?", (uid,)).fetchone()
+        return r["phone"] if r else None
+
     def claim_phone(self, phone: str, uid: int) -> None:
         self.c.execute("DELETE FROM phones WHERE user_id=?", (uid,))  # у одного Telegram — один номер
         self.c.execute("INSERT OR REPLACE INTO phones(phone,user_id) VALUES(?,?)", (phone, uid))
+        self.c.commit()
+
+    def unbind(self, uid: int) -> None:
+        self.c.execute("DELETE FROM phones WHERE user_id=?", (uid,))
         self.c.commit()
 
     # trial
@@ -540,6 +573,8 @@ class PremiumBot:
                     return self.cmd_revoke(chat_id, arg)
                 if cmd == "/pending":
                     return self.cmd_pending(chat_id)
+                if cmd == "/unbind":
+                    return self.cmd_unbind(chat_id, arg)
             return
         if m.get("photo") or (m.get("document") or {}).get("mime_type", "").startswith(("image/", "application/pdf")):
             return self.on_receipt(m)
@@ -575,6 +610,16 @@ class PremiumBot:
                 log.exception("Firebase phone_owner")
         return owner if owner is not None and owner != uid else None
 
+    def bound_phone(self, uid: int) -> Optional[str]:
+        """Номер, к которому этот Telegram уже привязан (SQLite → Firebase)."""
+        p = self.store.phone_of(uid)
+        if not p:
+            try:
+                p = self.fb.uid_phone(uid)
+            except Exception:
+                log.exception("Firebase uid_phone")
+        return p
+
     def login_code(self, m: dict, arg: str) -> None:
         """Вход в приложение: бот шлёт 6-значный код, а в Firebase кладёт только его хэш.
         arg = '<токен>' или '<токен>_<телефон 9 цифр>' (из приложения)."""
@@ -586,6 +631,7 @@ class PremiumBot:
         if not re.fullmatch(r"[0-9a-f]{16,64}", token):
             return self.send(chat_id, "Ссылка входа недействительна. Откройте приложение и повторите.")
         name = " ".join(x for x in (frm.get("first_name"), frm.get("last_name")) if x)
+        exp = int((self.now() + 600) * 1000)
         if reset and phone:  # сброс пароля — только для уже зарегистрированного номера
             known = self.store.phone_owner(phone)
             if known is None:
@@ -595,15 +641,27 @@ class PremiumBot:
                     log.exception("Firebase phone_owner")
             if known is None:
                 try:
-                    self.fb.set_verify(token, {"nf": True, "exp": int((self.now() + 600) * 1000)})
+                    self.fb.set_verify(token, {"nf": True, "exp": exp})
                 except Exception:
                     log.exception("Firebase verify nf")
                 return self.send(chat_id, f"⚠️ Аккаунт с номером {fmt_phone(phone)} не найден. Сначала зарегистрируйтесь в приложении.")
         if phone:
+            # 1) этот Telegram уже привязан к ДРУГОМУ номеру → ошибка с маской номера
+            bound = self.bound_phone(frm["id"])
+            if bound and bound != phone:
+                try:  # приложение увидит «Telegram уже привязан к номеру …»
+                    self.fb.set_verify(token, {"tgb": True, "m": mask_phone(bound), "exp": exp})
+                except Exception:
+                    log.exception("Firebase verify tgb")
+                return self.send(
+                    chat_id,
+                    f"⚠️ <b>Этот Telegram уже привязан к номеру {mask_phone(bound)}.</b>\n"
+                    f"Войдите в приложение с этим номером. Если номер нужно сменить — обратитесь к администратору.")
+            # 2) этот номер уже закреплён за другим Telegram
             owner = self.phone_conflict(phone, frm["id"])
             if owner is not None:
                 try:  # приложение увидит «номер занят» вместо ожидания кода
-                    self.fb.set_verify(token, {"dup": True, "exp": int((self.now() + 600) * 1000)})
+                    self.fb.set_verify(token, {"dup": True, "exp": exp})
                 except Exception:
                     log.exception("Firebase verify dup")
                 return self.send(
@@ -614,15 +672,16 @@ class PremiumBot:
         code = str(secrets.randbelow(900000) + 100000)
         try:
             self.fb.set_verify(token, {"uid": frm["id"], "name": name, "h": hashlib.sha256((token + code).encode()).hexdigest(),
-                                       "exp": int((self.now() + 600) * 1000)})
+                                       "exp": exp})
         except Exception:
             log.exception("Firebase verify")
             return self.send(chat_id, "⚠️ Сервер временно недоступен. Попробуйте ещё раз.")
         self.remember_user(frm, phone)
-        if phone:  # номер закрепляется за этим Telegram
+        if phone:  # chat id и номер закрепляются друг за другом
             self.store.claim_phone(phone, frm["id"])
             try:
                 self.fb.set_phone_owner(phone, frm["id"])
+                self.fb.set_uid_phone(frm["id"], phone)
             except Exception:
                 log.exception("Firebase set_phone_owner")
         title = "🔑 Код для сброса пароля OK-Mobile" if reset else "🔐 Код входа в OK-Mobile"
@@ -873,6 +932,21 @@ class PremiumBot:
             return self.send(chat_id, "❌ Не удалось удалить запись в Firebase, см. журнал бота.")
         self.store.del_premium(uid)
         self.send(chat_id, f"Премиум для <code>{uid}</code> отключён.")
+
+    def cmd_unbind(self, chat_id: int, arg: str) -> None:
+        """Отвязать номер от Telegram (например, человек ошибся номером при регистрации)."""
+        if not arg.strip().isdigit():
+            return self.send(chat_id, "Формат: /unbind <telegram_id>")
+        uid = int(arg.strip())
+        old = self.bound_phone(uid)
+        try:
+            self.fb.unbind(uid)
+        except Exception:
+            log.exception("Firebase unbind")
+            return self.send(chat_id, "❌ Не удалось отвязать в Firebase, см. журнал бота.")
+        self.store.unbind(uid)
+        self.send(chat_id, f"Номер {fmt_phone(old) if old else ''} отвязан от <code>{uid}</code>. "
+                           f"Теперь с этого Telegram можно зарегистрировать другой номер.")
 
     def cmd_pending(self, chat_id: int) -> None:
         rows = self.store.all_review()
