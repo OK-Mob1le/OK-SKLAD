@@ -363,7 +363,9 @@ PLN=id=>id=='trial'?'Пробный период':id=='gift'?'Подарок':id
 cd=ms=>{ms=Math.max(0,ms);return[Math.floor(ms/DAY),Math.floor(ms%DAY/36e5),Math.floor(ms%36e5/6e4)]},
 cdS=ms=>{const[d,h,m]=cd(ms);return d?d+'д '+h+'ч':h+'ч '+m+'м'},
 subChip=()=>{if(!U||U.demo||P.k!=U.id||P.u<=Date.now())return'';const l=P.u-Date.now();return`<button class="sc${l<3*DAY?' w':''}" data-a="tab" data-id="me" data-cd="chip" aria-label="Подписка">${I('crown',16)}<span>${cdS(l)}</span></button>`},
-botUrl=p=>`https://t.me/${CFG.BOT}?start=${p}`;
+bn=()=>String(CFG.BOT).replace(/^@/,''),
+botUrl=p=>`https://t.me/${bn()}?start=${p}`,
+openBot=p=>{const u=botUrl(p),d=`tg://resolve?domain=${bn()}&start=${p}`,t=setTimeout(()=>{if(!document.hidden)location.href=u},1600);document.addEventListener('visibilitychange',()=>{if(document.hidden)clearTimeout(t)},{once:true});location.href=d};
 const th=()=>{document.documentElement.dataset.th=LS.getItem('okm.th')||'dark';document.querySelector('meta[name=theme-color]').content=LS.getItem('okm.th')=='light'?'#EAF0FF':'#050816'};th();
 /* ===== курс валют (автоматически, в сомонӣ) + пароли ===== */
 const CN={TJS:['сомонӣ','сомонӣ'],USD:['доллар','$'],CNY:['юань','¥'],RUB:['рубль','₽']},TD=()=>new Date().toISOString().slice(0,10);
@@ -562,7 +564,7 @@ const cnt=(a,f)=>a.filter(f).length,seg=(k,items,cur,a)=>`<div class="seg" style
 /* ===== экраны ===== */
 const app=$('#app');function R(anim){app.className=anim?'in':'';app.innerHTML=!U?vAuth():plw()?vPay():`<div class="w">${S.sk?skel():vMain()}</div>`+(U&&!plw()?tabs():'');after();after2()}
 const skel=()=>`<div class="sk" style="height:60px;margin-bottom:16px"></div><div class="cards">${[1,2,3,4,5,6].map(()=>'<div class="sk" style="height:120px"></div>').join('')}</div><div class="sk" style="height:260px;margin-top:14px"></div>`;
-function vAuth(){if(S.a.step==3)return vSetPw();if(S.a.step==2)return`<div class="ctr in"><div class="logo" style="--i:0">${I('check')}</div><h1 style="--i:1">${S.a.m=='fp'?'Сброс пароля':'Код из Telegram'}</h1><p class="mu" style="--i:2">Нажмите <b>Start</b> в боте @${CFG.BOT} и введите 6-значный код.</p><div class="otp" style="--i:3">${[0,1,2,3,4,5].map(()=>'<input inputmode="numeric" maxlength="1">').join('')}</div><div class="err" id="er"></div><button class="b blk" data-a="again">Открыть бота ещё раз</button></div>`;
+function vAuth(){if(S.a.step==3)return vSetPw();if(S.a.step==2)return`<div class="ctr in"><div class="logo" style="--i:0">${I('check')}</div><h1 style="--i:1">${S.a.m=='fp'?'Сброс пароля':'Код из Telegram'}</h1><p class="mu" style="--i:2">Нажмите <b>Start</b> в боте @${bn()} и введите 6-значный код.</p><div class="otp" style="--i:3">${[0,1,2,3,4,5].map(()=>'<input inputmode="numeric" maxlength="1">').join('')}</div><div class="err" id="er"></div><button class="b blk" data-a="again">Открыть бота ещё раз</button></div>`;
  return`<div class="ctr in"><div class="logo" style="--i:0;width:84px;height:84px;background:none;box-shadow:none">${cube(84)}</div><div class="ac" style="--i:1"><div class="acb">${authBody(S.a.m||'in')}</div></div></div>`}
 const PH='M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 1.9.7 2.8a2 2 0 0 1-.5 2.1L8.1 9.9a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.8.7a2 2 0 0 1 1.7 2z';
 function authBody(m){PA.phone=PA.phone||PH;const up=m=='up',fp=m=='fp',pw=i=>`<div class="fg st" style="--i:${i}"><span class="lb">Пароль</span><label class="fd">${I('lock')}<input id="pw" type="password" placeholder="Пароль" autocomplete="${up?'new-password':'current-password'}"><button type="button" class="eye" aria-label="Показать пароль">${I('eye')}</button></label></div>`;
@@ -592,7 +594,7 @@ async function login(ph,pw){const er=$('#er'),LK='okm.lk.'+ph,lk=JP(LK,{n:0,t:0}
   if(!r){await fx.fail();return bad('Для этого номера пароль не установлен. Войдите через код Telegram или зарегистрируйтесь.')}
   if(await hpw(pw,r.s)!==r.h){const n=lk.n+1;LS.setItem(LK,JSON.stringify({n,t:n>=5?Date.now()+6e4*Math.min(n-4,10):0}));await fx.fail();return bad('Неверный пароль')}
   LS.removeItem(LK);await fx.ok();await enter(r.uid,r.n||'Пользователь',ph)}catch(e){await fx.fail();bad('Нет связи с сервером')}}
-function tgStart(o){const a=new Uint8Array(12);crypto.getRandomValues(a);S.a={...o,step:2,t:[...a].map(x=>x.toString(16).padStart(2,'0')).join('')};location.href=botUrl('v'+S.a.t+'_'+p9(o.p)+(o.m=='fp'?'_r':''));R(1)}
+function tgStart(o){const a=new Uint8Array(12);crypto.getRandomValues(a);S.a={...o,step:2,t:[...a].map(x=>x.toString(16).padStart(2,'0')).join('')};openBot('v'+S.a.t+'_'+p9(o.p)+(o.m=='fp'?'_r':''));R(1)}
 document.addEventListener('click',e=>{const b=e.target.closest('.eye');if(b){const i=b.parentElement.querySelector('input');i.type=i.type=='password'?'text':'password'}});
 async function authSw(m){
  const c=document.querySelector('.ac');if(!c||c.dataset.b||(S.a.m||'in')==m)return;c.dataset.b=1;
@@ -784,8 +786,8 @@ const A={
   const e=document.createElement('div');e.className='ov';e.innerHTML=`<div class="sh"><div class="grab"></div><h1 style="font-size:22px">${r?'Сменить пароль':'Установить пароль'}</h1>${r?'<label>Текущий пароль</label><input id="op" type="password" autocomplete="current-password">':''}<label>Новый пароль (минимум 6 символов)</label><input id="np" type="password" autocomplete="new-password"><div class="err" id="pe"></div><div style="display:flex;gap:10px;margin-top:20px"><button class="b" id="cn">Отмена</button><button class="b pri" id="sv" style="flex:1">${I('check')}Сохранить</button></div></div>`;
   document.body.append(e);const x=()=>e.remove();e.onclick=v=>{if(v.target==e)x()};e.querySelector('#cn').onclick=x;
   e.querySelector('#sv').onclick=async()=>{const n=e.querySelector('#np').value,er=e.querySelector('#pe');if(n.length<6)return er.textContent='Минимум 6 символов';if(r&&await hpw(e.querySelector('#op').value,r.s)!==r.h)return er.textContent='Текущий пароль неверный';try{await setPw(ph,U.id,U.name,n);x();toast('Пароль сохранён')}catch(_){er.textContent='Не удалось сохранить'}}},
- again(){location.href=botUrl('v'+S.a.t+'_'+p9(S.a.p)+(S.a.m=='fp'?'_r':''))},demo(){U={id:'demo',name:'Демо-пользователь',phone:'+992 900 00 00 00',demo:1};seed();S.sk=1;R(0);skOff()},
- buy(){const e=s=>btoa(unescape(encodeURIComponent(s))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''),pl=S.pl||'m3',ph=(U.phone||'').replace(/\D/g,'').slice(-9),mk=n=>e(ph+'|'+pl+'|'+n);let nm=U.name||'';while(nm&&mk(nm).length>63)nm=nm.slice(0,-1);LS.setItem('okm.pp',JSON.stringify({pl,ts:Date.now()}));location.href=botUrl('p'+mk(nm))},
+ again(){openBot('v'+S.a.t+'_'+p9(S.a.p)+(S.a.m=='fp'?'_r':''))},demo(){U={id:'demo',name:'Демо-пользователь',phone:'+992 900 00 00 00',demo:1};seed();S.sk=1;R(0);skOff()},
+ buy(){const e=s=>btoa(unescape(encodeURIComponent(s))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''),pl=S.pl||'m3',ph=(U.phone||'').replace(/\D/g,'').slice(-9),mk=n=>e(ph+'|'+pl+'|'+n);let nm=U.name||'';while(nm&&mk(nm).length>63)nm=nm.slice(0,-1);LS.setItem('okm.pp',JSON.stringify({pl,ts:Date.now()}));openBot('p'+mk(nm))},
  chk(){payFx(0);prem()},out(){if(U.demo)LS.removeItem('okm.d.demo');LS.removeItem('okm.u');U=null;S={tab:'dash',c:null,s:null,pd:'w',cr:'30',pt:'p',q:'',cart:{},a:{}};R(1)},
  tab(e){sw(()=>{S.tab=e.id;S.q='';if(e.id=='cat'){S.c=S.s=null}})},back(){S.s=null;S.c=null;R(1)},
  th(){document.documentElement.classList.add('tt');LS.setItem('okm.th',LS.getItem('okm.th')=='light'?'dark':'light');th();setTimeout(()=>document.documentElement.classList.remove('tt'),600);R(0)},
