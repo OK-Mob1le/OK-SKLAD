@@ -425,6 +425,8 @@ class PremiumBot:
         self.cfg, self.tg, self.store, self.fb, self.now = cfg, tg, store, fb, clock
         self._last_notice = 0.0
         self._last_alerts = 0.0
+        self._rate = 0.0
+        self._rate_ts = 0.0
 
     # --- отправка ---
     def send(self, chat_id: int, text: str, markup: Optional[dict] = None) -> Optional[dict]:
@@ -440,12 +442,33 @@ class PremiumBot:
         return kb([[("📱 Открыть приложение", "url:" + self.cfg.app_url)]]) if self.cfg.app_url.startswith("http") else None
 
     # --- тексты ---
+    def rate(self) -> float:
+        """Курс сомонӣ за $1: из USD_TJS или автоматически (обновляется раз в 6 часов)."""
+        if self.cfg.usd_tjs > 0:
+            return self.cfg.usd_tjs
+        if self._rate and time.time() - self._rate_ts < 6 * 3600:
+            return self._rate
+        for url in ("https://open.er-api.com/v6/latest/USD", "https://api.exchangerate-api.com/v4/latest/USD"):
+            try:
+                v = float(requests.get(url, timeout=8).json()["rates"]["TJS"])
+                if v > 0:
+                    self._rate, self._rate_ts = v, time.time()
+                    return v
+            except Exception:
+                continue
+        return self._rate  # старое значение или 0 — тогда сомонӣ не показываем
+
+    def rate_line(self) -> str:
+        r = self.rate()
+        return f"\nКурби имрӯза: 1 $ = {r:.2f} сомонӣ" if r else ""
+
     def money(self, pid: str) -> str:
         """Сумма тарифа: «$26.64» и, если задан USD_TJS, «≈ 280 сомони»."""
         p = PLANS[pid]
         s = usd(p["usd"])
-        if self.cfg.usd_tjs > 0:
-            s += f" (≈ {round(p['usd'] * self.cfg.usd_tjs)} сомони)"
+        r = self.rate()
+        if r > 0 and p["usd"] > 0:
+            s += f" (≈ {round(p['usd'] * r)} сомонӣ)"
         return s
 
     def requisites_text(self, pay, premium_until_ms: Optional[int]) -> str:
@@ -461,7 +484,7 @@ class PremiumBot:
         note = c.note.replace("{plan}", p["name"])
         return (
             f"💎 <b>Вы выбрали тариф: {p['name']}</b>\n"
-            f"К оплате: <b>{self.money(pid)}</b>{per}\n\n{extra}"
+            f"К оплате: <b>{self.money(pid)}</b>{per}{self.rate_line()}\n\n{extra}"
             f"Оплатите на карту:\n<code>{html.escape(c.card)}</code>\n"
             f"Получатель: <b>{html.escape(c.holder)}</b>\n"
             f"Сумма: <b>{self.money(pid)}</b>\n"
@@ -556,11 +579,26 @@ class PremiumBot:
         """Вход в приложение: бот шлёт 6-значный код, а в Firebase кладёт только его хэш.
         arg = '<токен>' или '<токен>_<телефон 9 цифр>' (из приложения)."""
         frm, chat_id = m["from"], m["chat"]["id"]
-        token, _, ph = arg.partition("_")
+        parts = arg.split("_")  # <токен>[_<телефон>[_r]]  (r = сброс пароля)
+        token, ph = parts[0], (parts[1] if len(parts) > 1 else "")
+        reset = "r" in parts[2:]
         phone = ph if re.fullmatch(r"\d{9}", ph) else ""
         if not re.fullmatch(r"[0-9a-f]{16,64}", token):
             return self.send(chat_id, "Ссылка входа недействительна. Откройте приложение и повторите.")
         name = " ".join(x for x in (frm.get("first_name"), frm.get("last_name")) if x)
+        if reset and phone:  # сброс пароля — только для уже зарегистрированного номера
+            known = self.store.phone_owner(phone)
+            if known is None:
+                try:
+                    known = self.fb.phone_owner(phone)
+                except Exception:
+                    log.exception("Firebase phone_owner")
+            if known is None:
+                try:
+                    self.fb.set_verify(token, {"nf": True, "exp": int((self.now() + 600) * 1000)})
+                except Exception:
+                    log.exception("Firebase verify nf")
+                return self.send(chat_id, f"⚠️ Аккаунт с номером {fmt_phone(phone)} не найден. Сначала зарегистрируйтесь в приложении.")
         if phone:
             owner = self.phone_conflict(phone, frm["id"])
             if owner is not None:
@@ -587,7 +625,8 @@ class PremiumBot:
                 self.fb.set_phone_owner(phone, frm["id"])
             except Exception:
                 log.exception("Firebase set_phone_owner")
-        self.send(chat_id, f"🔐 Код входа в OK-Mobile: <code>{code}</code>\nДействует 10 минут. Никому его не сообщайте.")
+        title = "🔑 Код для сброса пароля OK-Mobile" if reset else "🔐 Код входа в OK-Mobile"
+        self.send(chat_id, f"{title}: <code>{code}</code>\nДействует 10 минут. Никому его не сообщайте.")
 
     def cmd_start(self, m: dict, payload: str) -> None:
         if payload.startswith("v"):
